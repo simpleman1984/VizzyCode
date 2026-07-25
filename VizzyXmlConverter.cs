@@ -19,6 +19,7 @@ namespace VizzyCode
         private HashSet<string> _localVariables = new(StringComparer.Ordinal);
         // Maps sanitized C# identifier → original CustomInstruction name for CI call detection.
         private Dictionary<string, string> _ciNameMap = new(StringComparer.Ordinal);
+        private Dictionary<string, string> _widgetVarMap = new(StringComparer.Ordinal);
         private XElement? _pendingTopLevelHeader;
         private XElement? _pendingInstructionMetadata;
         private (int X, int Y)? _pendingTopLevelPosition;
@@ -142,6 +143,7 @@ namespace VizzyCode
         {
             _listVariables.Clear();
             _warnings.Clear();
+            _widgetVarMap.Clear();
 
             string name = program.Attribute("name")?.Value ?? "MyProgram";
             var sb = new StringBuilder();
@@ -1429,6 +1431,7 @@ namespace VizzyCode
                 !code.Contains("Vz.RawCraftProperty(", StringComparison.Ordinal) &&
                 !code.Contains("Vz.RawEval(", StringComparison.Ordinal);
             _listVariables.Clear();
+            _widgetVarMap.Clear();
             var lines = code.Split('\n').Select(l => l.TrimEnd()).ToList();
             string resolvedProgramName = programName;
             foreach (var rawLine in lines)
@@ -1504,6 +1507,17 @@ namespace VizzyCode
                     ? new XElement("Variable", new XAttribute("name", vname), new XElement("Items"))
                     : CreateVariableDeclaration(vname, vval));
                 declaredVariables.Add(vname);
+            }
+
+            // Pre-scan 3: build widget variable → widget name map from all VzXxx var = new VzXxx(...) lines.
+            // This must happen before the main loop so forward references (e.g. lblMode used inside
+            // OnStart but declared after it) are resolved correctly.
+            foreach (var rawLine in lines)
+            {
+                var wMatch = System.Text.RegularExpressions.Regex.Match(rawLine.Trim(),
+                    @"^Vz(?<type>\w+)\s+(?<varName>\w+)\s*=\s*new\s+Vz\w+\((?<nameArg>.+)\)$");
+                if (wMatch.Success)
+                    _widgetVarMap[wMatch.Groups["varName"].Value] = wMatch.Groups["nameArg"].Value.Trim();
             }
 
             for (int i = 0; i < lines.Count; i++)
@@ -2320,11 +2334,13 @@ namespace VizzyCode
             if (l.StartsWith("Vz.SetPitch("))
                 return new XElement("SetTargetHeading", new XAttribute("property", "pitch"), new XAttribute("style", "set-heading"), MakeConstantArg(c1));
 
-            var createWidgetMatch = System.Text.RegularExpressions.Regex.Match(l, @"^Vz(?<type>\w+)\s+\w+\s*=\s*new\s+Vz\w+\((?<nameArg>.+)\)$");
+            var createWidgetMatch = System.Text.RegularExpressions.Regex.Match(l, @"^Vz(?<type>\w+)\s+(?<varName>\w+)\s*=\s*new\s+Vz\w+\((?<nameArg>.+)\)$");
             if (createWidgetMatch.Success)
             {
                 string widgetType = createWidgetMatch.Groups["type"].Value;
+                string varName = createWidgetMatch.Groups["varName"].Value;
                 string nameArg = createWidgetMatch.Groups["nameArg"].Value.Trim();
+                _widgetVarMap[varName] = nameArg;
                 var nameEl = ConvertWidgetNameArgToXml(nameArg);
                 return new XElement("SetCraftProperty",
                     new XAttribute("property", "Mfd.Create." + widgetType),
@@ -2333,7 +2349,7 @@ namespace VizzyCode
             }
 
             var setWidgetMatch = System.Text.RegularExpressions.Regex.Match(l,
-                @"^(?<widget>.+)\.(?<property>Size|Color|Opacity|Parent|Position|Rotation|Visible|Anchor|Alignment|Text|AutoSize|AutoScroll|Font|FontSize|FillAmount|FillMethod|Icon|FillColor|TextColor|BackgroundColor|NorthUp|ManualMode|Zoom|Coordinates|Heading|PlanetName|Value|ShowVelocity|ShowGroundTrack|ShowOrbit)\s*=\s*(?<value>.+)$");
+                @"^(?<widget>.+)\.(?<property>Size|Color|Opacity|Parent|Position|Rotation|Visible|Anchor|Alignment|Text|AutoSize|AutoScroll|Font|FontSize|FillAmount|FillMethod|Icon|FillColor|TextColor|BackgroundColor|NorthUp|ManualMode|Zoom|Coordinates|Heading|PlanetName|Value|ShowVelocity|ShowGroundTrack|ShowOrbit|OnPointerClick)\s*=\s*(?<value>.+)$");
             if (setWidgetMatch.Success)
             {
                 string property = setWidgetMatch.Groups["property"].Value;
@@ -2357,6 +2373,16 @@ namespace VizzyCode
                         new XAttribute("property", "Mfd.Widget.SetAnchor." + anchor),
                         new XAttribute("style", "set-mfd-widget"),
                         widgetEl);
+                }
+
+                if (property == "OnPointerClick")
+                {
+                    return new XElement("SetCraftProperty",
+                        new XAttribute("property", "Mfd.Event.SetPointerClick"),
+                        new XAttribute("style", "set-mfd-event"),
+                        widgetEl,
+                        ConvertValueToXml(value),
+                        new XElement("Constant", new XAttribute("text", "")));
                 }
 
                 string mfdProperty;
@@ -2625,6 +2651,9 @@ namespace VizzyCode
         private XElement ConvertWidgetNameArgToXml(string nameArg)
         {
             string trimmed = nameArg.Trim();
+            // Widget variable declared via VzXxx var = new VzXxx("name") → emit Constant with widget name
+            if (_widgetVarMap.TryGetValue(trimmed, out string? widgetNameExpr))
+                return ConvertWidgetNameArgToXml(widgetNameExpr);
             if (trimmed.StartsWith("\"") && trimmed.EndsWith("\""))
             {
                 string inner = Unescape(trimQuotes(trimmed));
